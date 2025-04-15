@@ -1,0 +1,73 @@
+{
+  description = "PipeWire/OpenGL/ImGui FFT Audio Visualizer";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        pipewire = pkgs.pipewire;
+        glfw = pkgs.glfw;
+        fftw = pkgs.fftw;
+        imgui = pkgs.imgui;
+        # ImGui needs the backend files. Many distros/package managers do not provide ready-to-use compiled C++ headers/libs for the ImGui OpenGL and GLFW backends.
+        # We'll use the bundled pkgs.imgui, but add its backends to include path.
+        # The GL/gl.h header is in mesa or libGL (GLU), often via mesa.dev.
+        libGL = pkgs.libGL;
+        # pthread is glibc/libc.
+        stdenv = pkgs.stdenv;
+        src = ./src.cpp;
+      in {
+        packages.default = pkgs.stdenv.mkDerivation {
+          name = "pipewire-fft-vis";
+          src = src;
+	  dontUnpack = true;
+          buildInputs = [
+            pipewire
+            fftw
+	    pkgs.fftwFloat
+            glfw
+            imgui
+            libGL
+          ];
+          # Add ImGui's 'backends' directory to include path.
+          # imgui + imgui/backends headers are needed; in nixpkgs, pkgs.imgui includes both src/ and backends/ in include.
+          NIX_CFLAGS_COMPILE = ''
+            -I${imgui}/include
+            -I${imgui}/include/imgui
+            -I${imgui}/include/imgui/backends
+            -DGL_SILENCE_DEPRECATION
+          '';
+          # Link to imgui's implementation and other required libs
+          buildPhase = ''
+            g++ -o pipewire-fft-vis $src \
+              -Wall -O2 \
+              -I${pipewire.dev}/include/pipewire-0.3 \
+              -I${pipewire.dev}/include/spa-0.2 \
+              -I${fftw.dev}/include \
+              -I${glfw}/include \
+              -I${imgui}/include \
+              -I${imgui}/include/imgui \
+              -I${imgui}/include/imgui/backends \
+              -L${pipewire.out}/lib -lpipewire-0.3 \
+              -L${fftw.out}/lib -lfftw3f \
+              -L${glfw.out}/lib -lglfw \
+              -L${libGL.out}/lib -lGL \
+              -lpthread \
+              -ldl
+          '';
+          installPhase = ''
+            mkdir -p $out/bin
+            cp pipewire-fft-vis $out/bin/
+          '';
+        };
+        apps.default = flake-utils.lib.mkApp {
+          drv = self.packages.${system}.default;
+        };
+      }
+    );
+}

@@ -1,0 +1,496 @@
+#define GL_GLEXT_PROTOTYPES
+
+#include <GL/gl.h>
+#include <GLFW/glfw3.h>
+#include <assert.h>
+#include <fftw3.h>
+#include <math.h>
+#include <pipewire/pipewire.h>
+#include <pipewire/stream.h>
+#include <pthread.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/param/audio/raw.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define SAMPLE_RATE 44100
+#define BLOCK_SIZE 512
+#define BAR_BIN_SIZE 6
+#define NUM_BARS (BLOCK_SIZE / (2 * BAR_BIN_SIZE))
+#define NUM_VERT_PER_BAR 4
+#define SMOOTH_FACTOR 0.30f
+#define SMOOTH_PEAK 0.18f
+#define DB_FLOOR -60.0f
+#define DB_CEIL 0.0f
+#define AUDIO_LEVEL_BAR_WIDTH_FRAC 0.15f
+#define AUDIO_LEVEL_BAR_HEIGHT 20.0f
+#define AUDIO_LEVEL_BAR_X 10.0f
+#define AUDIO_LEVEL_BAR_Y 10.0f
+
+typedef struct {
+  float magnitudes[NUM_BARS];
+  float target_mags[NUM_BARS];
+  float color_phase[NUM_BARS];
+  float color_vel[NUM_BARS];
+  float peaks[NUM_BARS];
+  float peaks_vel[NUM_BARS];
+  float audio_level;
+  float target_level;
+  float bin_maxes[NUM_BARS];
+  float bin_ema[NUM_BARS];
+  pthread_mutex_t mutex;
+} VisData;
+
+typedef struct {
+  struct pw_stream *stream;
+  struct spa_hook stream_listener;
+  VisData *vis_data;
+  int inbuf_pos;
+  float inbuf[BLOCK_SIZE];
+} AudioData;
+
+static float freq_table[NUM_BARS + 1];
+
+static void make_freq_table() {
+  const float min_hz = 40.0f, max_hz = 20000.0f;
+  for (int i = 0; i <= NUM_BARS; ++i) {
+    float t = (float)i / (float)NUM_BARS;
+    freq_table[i] = min_hz * powf(max_hz / min_hz, t);
+  }
+}
+
+static int bin_freq_to_fft_bin(float freq) {
+  int bin = (int)roundf(freq * BLOCK_SIZE / SAMPLE_RATE);
+  if (bin < 0)
+    bin = 0;
+  if (bin > BLOCK_SIZE / 2)
+    bin = BLOCK_SIZE / 2;
+  return bin;
+}
+
+static void process_fft(VisData *vis_data, float *samples, int n) {
+  static fftwf_plan plan = NULL;
+  static float fft_in[BLOCK_SIZE];
+  static fftwf_complex fft_out[BLOCK_SIZE];
+
+  if (!plan) {
+    plan = fftwf_plan_dft_r2c_1d(BLOCK_SIZE, fft_in, fft_out, FFTW_MEASURE);
+    assert(plan && "FFTW Plan creation error!");
+  }
+  memcpy(fft_in, samples, sizeof(float) * BLOCK_SIZE);
+  fftwf_execute(plan);
+
+  float bin_avgs[NUM_BARS] = {0};
+
+  for (int i = 0; i < NUM_BARS; ++i) {
+    int b0 = bin_freq_to_fft_bin(freq_table[i]);
+    int b1 = bin_freq_to_fft_bin(freq_table[i + 1]);
+    if (b1 <= b0)
+      b1 = b0 + 1;
+    b1 = b1 > BLOCK_SIZE / 2 ? BLOCK_SIZE / 2 : b1;
+
+    float sum = 0.0f;
+    int nsum = 0;
+    for (int j = b0; j < b1; ++j) {
+      float re = fft_out[j][0];
+      float im = fft_out[j][1];
+      float mag = sqrtf(re * re + im * im);
+      sum += mag;
+      nsum++;
+    }
+    bin_avgs[i] = (nsum > 0) ? sum / nsum : 0.0f;
+  }
+
+  pthread_mutex_lock(&vis_data->mutex);
+  for (int i = 0; i < NUM_BARS; ++i) {
+    float mag = bin_avgs[i];
+    float db = 20.0f * log10f(mag + 1e-10f);
+    if (!isfinite(db))
+      db = DB_FLOOR;
+    db = fmaxf(DB_FLOOR, db);
+    db = fminf(DB_CEIL, db);
+    float norm = (db - DB_FLOOR) / (DB_CEIL - DB_FLOOR);
+    float maxref =
+        (vis_data->bin_maxes[i] < 1e-10f) ? 1e-10f : vis_data->bin_maxes[i];
+    float rel = mag / maxref;
+    vis_data->bin_ema[i] = 0.6f * vis_data->bin_ema[i] + 0.4f * rel;
+    float finalval = norm * powf(vis_data->bin_ema[i], 0.7f);
+
+    vis_data->target_mags[i] = finalval;
+
+    // Color phase velocity - make it more dynamic based on change in signal
+    float phase_step =
+        1.0f + 2.5f * finalval + fabsf(finalval - vis_data->magnitudes[i]);
+    if (phase_step > 8.5f)
+      phase_step = 8.5f;
+    if (phase_step < 0.5f)
+      phase_step = 0.5f;
+    vis_data->color_vel[i] = 0.6f * vis_data->color_vel[i] + 0.4f * phase_step;
+
+    // Peaks (falling peak bars)
+    if (finalval > vis_data->peaks[i] + 0.007f) {
+      vis_data->peaks[i] = finalval;
+      vis_data->peaks_vel[i] = 0.08f + 0.06f * finalval;
+    }
+    // slow exponential decay for bin max
+    if (vis_data->bin_maxes[i] < mag)
+      vis_data->bin_maxes[i] = mag;
+    vis_data->bin_maxes[i] *= 0.995f;
+  }
+
+  float sumsq = 0.0f;
+  for (int i = 0; i < BLOCK_SIZE; ++i)
+    sumsq += samples[i] * samples[i];
+  vis_data->target_level = sqrtf(sumsq / BLOCK_SIZE);
+
+  pthread_mutex_unlock(&vis_data->mutex);
+}
+
+static void on_stream_process(void *data) {
+  AudioData *ad = (AudioData *)data;
+  struct pw_buffer *buf;
+  struct spa_buffer *spa_buf;
+  buf = pw_stream_dequeue_buffer(ad->stream);
+  if (!buf)
+    return;
+  spa_buf = buf->buffer;
+  void *ptr = spa_buf->datas[0].data;
+  int size = spa_buf->datas[0].chunk->size / sizeof(float);
+  float *samples = (float *)ptr;
+  while (size > 0) {
+    int to_copy = BLOCK_SIZE - ad->inbuf_pos;
+    if (to_copy > size)
+      to_copy = size;
+    memcpy(ad->inbuf + ad->inbuf_pos, samples, to_copy * sizeof(float));
+    ad->inbuf_pos += to_copy;
+    samples += to_copy;
+    size -= to_copy;
+    if (ad->inbuf_pos == BLOCK_SIZE) {
+      process_fft(ad->vis_data, ad->inbuf, BLOCK_SIZE);
+      ad->inbuf_pos = 0;
+    }
+  }
+  pw_stream_queue_buffer(ad->stream, buf);
+}
+
+static const struct pw_stream_events stream_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_stream_process,
+};
+
+static int init_pipewire(AudioData *ad) {
+  pw_init(NULL, NULL);
+  struct pw_main_loop *loop = pw_main_loop_new(NULL);
+  if (!loop)
+    return -1;
+  struct pw_context *context =
+      pw_context_new(pw_main_loop_get_loop(loop), NULL, 0);
+  if (!context)
+    return -1;
+  struct pw_core *core = pw_context_connect(context, NULL, 0);
+  if (!core)
+    return -1;
+
+  ad->stream = pw_stream_new(core, "Capture", pw_properties_new(NULL, NULL));
+  if (!ad->stream)
+    return -1;
+  pw_stream_add_listener(ad->stream, &ad->stream_listener, &stream_events, ad);
+
+  struct spa_audio_info_raw info = {.format = SPA_AUDIO_FORMAT_F32,
+                                    .rate = SAMPLE_RATE,
+                                    .channels = 1,
+                                    .position = {SPA_AUDIO_CHANNEL_MONO}};
+  uint8_t buffer[1024];
+  struct spa_pod_builder b;
+  spa_pod_builder_init(&b, buffer, sizeof(buffer));
+  struct spa_pod *param =
+      spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info);
+
+  enum pw_stream_flags flags = (enum pw_stream_flags)(
+      PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS);
+  int res = pw_stream_connect(ad->stream, PW_DIRECTION_INPUT, PW_ID_ANY, flags,
+                              (const struct spa_pod **)&param, 1);
+  if (res < 0)
+    return -1;
+
+  pthread_t thread;
+  pthread_create(&thread, NULL, (void *(*)(void *))pw_main_loop_run, loop);
+  pthread_detach(thread);
+  return 0;
+}
+
+static void interpolate_and_smooth(VisData *vis_data) {
+  pthread_mutex_lock(&vis_data->mutex);
+  for (int i = 0; i < NUM_BARS; ++i) {
+    vis_data->magnitudes[i] +=
+        SMOOTH_FACTOR * (vis_data->target_mags[i] - vis_data->magnitudes[i]);
+    vis_data->color_phase[i] += 0.045f * vis_data->color_vel[i];
+    if (vis_data->color_phase[i] > 10000.0f)
+      vis_data->color_phase[i] -= 10000.0f;
+    // Update bars' peak fall
+    if (vis_data->peaks[i] > vis_data->magnitudes[i] + 0.011f)
+      vis_data->peaks[i] -= SMOOTH_PEAK * vis_data->peaks_vel[i];
+    if (vis_data->peaks[i] < vis_data->magnitudes[i])
+      vis_data->peaks[i] = vis_data->magnitudes[i];
+  }
+  vis_data->audio_level +=
+      SMOOTH_FACTOR * (vis_data->target_level - vis_data->audio_level);
+  pthread_mutex_unlock(&vis_data->mutex);
+}
+
+static void update_vbo(GLuint vbo, VisData *vis_data, float width,
+                       float height) {
+  float gap = width * 0.01f;
+  float bar_w = (width - gap * (NUM_BARS + 1)) / NUM_BARS;
+
+  float verts[NUM_BARS * NUM_VERT_PER_BAR * 2];
+  pthread_mutex_lock(&vis_data->mutex);
+  for (int i = 0; i < NUM_BARS; ++i) {
+    float x0 = gap + i * (bar_w + gap);
+    float x1 = x0 + bar_w;
+    float y0 = 0.0f;
+    float y1 = vis_data->magnitudes[i] * height * 0.90f + height * 0.08f;
+    y1 = fmaxf(y1, y0 + 2);
+    verts[i * 8 + 0] = x0;
+    verts[i * 8 + 1] = y0;
+    verts[i * 8 + 2] = x1;
+    verts[i * 8 + 3] = y0;
+    verts[i * 8 + 4] = x1;
+    verts[i * 8 + 5] = y1;
+    verts[i * 8 + 6] = x0;
+    verts[i * 8 + 7] = y1;
+  }
+  pthread_mutex_unlock(&vis_data->mutex);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+}
+
+static void hsv2rgb(float h, float s, float v, float *r, float *g, float *b) {
+  float c = v * s;
+  float hp = h * 6.0f;
+  float x = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
+  float rp = 0, gp = 0, bp = 0;
+  if (0.0 <= hp && hp < 1.0) {
+    rp = c, gp = x, bp = 0;
+  } else if (1.0 <= hp && hp < 2.0) {
+    rp = x, gp = c, bp = 0;
+  } else if (2.0 <= hp && hp < 3.0) {
+    rp = 0, gp = c, bp = x;
+  } else if (3.0 <= hp && hp < 4.0) {
+    rp = 0, gp = x, bp = c;
+  } else if (4.0 <= hp && hp < 5.0) {
+    rp = x, gp = 0, bp = c;
+  } else if (5.0 <= hp && hp < 6.0) {
+    rp = c, gp = 0, bp = x;
+  }
+  float m = v - c;
+  *r = rp + m;
+  *g = gp + m;
+  *b = bp + m;
+}
+
+static void render_bars(GLuint vao, VisData *vis_data, float width,
+                        float height) {
+  glBindVertexArray(vao);
+  pthread_mutex_lock(&vis_data->mutex);
+  for (int i = 0; i < NUM_BARS; ++i) {
+    float t = (float)i / (NUM_BARS - 1);
+    float v = vis_data->magnitudes[i];
+    float peak = vis_data->peaks[i];
+    float s = 0.55f + 0.45f * v;
+    if (s > 1.0f)
+      s = 1.0f;
+    float base_hue = t * 0.82f; // sweep blue->red
+    float hue =
+        base_hue + 0.15f * sinf(vis_data->color_phase[i] * 1.8f + v * 3.1415f);
+    hue = fmodf(hue, 1.0f);
+    if (hue < 0)
+      hue += 1.0f;
+    float r, g, b;
+    // Vary brightness with bar
+    float val = 0.48f + v * 0.45f;
+    hsv2rgb(hue, s, val, &r, &g, &b);
+    glColor3f(r, g, b);
+    glDrawArrays(GL_TRIANGLE_FAN, i * NUM_VERT_PER_BAR, NUM_VERT_PER_BAR);
+
+    // Subtle highlight using white semi-transparency at bar tops
+    if (v > 0.12f) {
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      glColor4f(1.0f, 1.0f, 1.0f, t * 0.13f + 0.08f + v * 0.08f);
+      float gap = width * 0.01f;
+      float bar_w = (width - gap * (NUM_BARS + 1)) / NUM_BARS;
+      float x0 = gap + i * (bar_w + gap);
+      float x1 = x0 + bar_w;
+      float y1 = vis_data->magnitudes[i] * height * 0.90f + height * 0.08f;
+      float tpad = bar_w * 0.08f;
+      float tlen = fmaxf(bar_w * 0.84f, 8);
+      float tthick = 3.6f + v * 5.5f;
+      glBegin(GL_QUADS);
+      glVertex2f(x0 + tpad, y1 - tthick);
+      glVertex2f(x1 - tpad, y1 - tthick);
+      glVertex2f(x1 - tpad, y1);
+      glVertex2f(x0 + tpad, y1);
+      glEnd();
+      glDisable(GL_BLEND);
+    }
+
+    // Draw peak
+    if (peak > 0.015f) {
+      float gap = width * 0.01f;
+      float bar_w = (width - gap * (NUM_BARS + 1)) / NUM_BARS;
+      float px0 = gap + i * (bar_w + gap) + bar_w * 0.12f;
+      float px1 = px0 + bar_w * 0.76f;
+      float py = peak * height * 0.90f + height * 0.08f - 1.1f;
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      glColor4f(r, g, b, 0.56f + 0.17f * v);
+      glBegin(GL_QUADS);
+      glVertex2f(px0, py - 2);
+      glVertex2f(px1, py - 2);
+      glVertex2f(px1, py + 2);
+      glVertex2f(px0, py + 2);
+      glEnd();
+      glDisable(GL_BLEND);
+    }
+  }
+  pthread_mutex_unlock(&vis_data->mutex);
+}
+
+static void draw_audio_level(float level, int w, int h) {
+  float bar_w = w * AUDIO_LEVEL_BAR_WIDTH_FRAC;
+  float bar_h = AUDIO_LEVEL_BAR_HEIGHT;
+  float bar_x = AUDIO_LEVEL_BAR_X;
+  float bar_y = AUDIO_LEVEL_BAR_Y;
+  float filled = level * bar_w;
+
+  glViewport(0, 0, w, h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, w, 0, h, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+
+  glColor3f(0.13f, 0.14f, 0.16f);
+  glBegin(GL_QUADS);
+  glVertex2f(bar_x, bar_y);
+  glVertex2f(bar_x + bar_w, bar_y);
+  glVertex2f(bar_x + bar_w, bar_y + bar_h);
+  glVertex2f(bar_x, bar_y + bar_h);
+  glEnd();
+
+  float green = (level < 0.75f) ? (0.5f + 0.50f * level) : 0.55f;
+  float red =
+      (level > 0.75f) ? (0.4f + 0.60f * (level - 0.75f) / 0.25f) : 0.23f;
+  glColor3f(red, green, 0.25f + green * 0.3f);
+
+  glBegin(GL_QUADS);
+  glVertex2f(bar_x, bar_y);
+  glVertex2f(bar_x + filled, bar_y);
+  glVertex2f(bar_x + filled, bar_y + bar_h);
+  glVertex2f(bar_x, bar_y + bar_h);
+  glEnd();
+
+  // subtle white bar overlay
+  if (filled > 6.0f) {
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(1, 1, 1, 0.10f + 0.15f * level);
+    glBegin(GL_QUADS);
+    glVertex2f(bar_x + 1, bar_y + bar_h - 4);
+    glVertex2f(bar_x + filled - 1, bar_y + bar_h - 4);
+    glVertex2f(bar_x + filled - 1, bar_y + bar_h - 1);
+    glVertex2f(bar_x + 1, bar_y + bar_h - 1);
+    glEnd();
+    glDisable(GL_BLEND);
+  }
+}
+
+int main() {
+  VisData vis_data = {.audio_level = 0.0f, .target_level = 0.0f};
+  pthread_mutex_init(&vis_data.mutex, NULL);
+  for (int i = 0; i < NUM_BARS; ++i) {
+    vis_data.bin_maxes[i] = 1e-7f;
+    vis_data.bin_ema[i] = 1.0f;
+    vis_data.color_phase[i] = (i * 3457) % 2347 / 3541.0f;
+    vis_data.color_vel[i] = 1.0f + (i & 1);
+    vis_data.peaks[i] = 0.0f;
+    vis_data.peaks_vel[i] = 0.09f;
+  }
+  make_freq_table();
+
+  AudioData ad = {.vis_data = &vis_data, .inbuf_pos = 0};
+
+  if (init_pipewire(&ad)) {
+    fprintf(stderr, "Error: Failed to initialize PipeWire stream\n");
+    return 1;
+  }
+
+  if (!glfwInit())
+    return 1;
+  GLFWwindow *win =
+      glfwCreateWindow(900, 420, "PipeWire FFT Visualizer", NULL, NULL);
+  if (!win) {
+    glfwTerminate();
+    return 1;
+  }
+  glfwMakeContextCurrent(win);
+  glfwSwapInterval(1);
+
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  GLuint vaos[2], vbos[2];
+  glGenVertexArrays(2, vaos);
+  glGenBuffers(2, vbos);
+  for (int i = 0; i < 2; ++i) {
+    glBindVertexArray(vaos[i]);
+    glBindBuffer(GL_ARRAY_BUFFER, vbos[i]);
+    glBufferData(GL_ARRAY_BUFFER,
+                 NUM_BARS * NUM_VERT_PER_BAR * 2 * sizeof(float), NULL,
+                 GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void *)0);
+  }
+  int front = 0;
+
+  double last = glfwGetTime();
+  while (!glfwWindowShouldClose(win)) {
+    glfwPollEvents();
+    int w, h;
+    glfwGetFramebufferSize(win, &w, &h);
+
+    interpolate_and_smooth(&vis_data);
+
+    front = 1 - front;
+    update_vbo(vbos[front], &vis_data, (float)w, (float)h - 32);
+
+    float fade = 0.19f + 0.02f * sinf((float)glfwGetTime() * 0.63f);
+    glClearColor(0.039f + fade, 0.048f + fade * 0.9f, 0.087f + fade * 1.2f, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glViewport(0, 32, w, h - 32);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, w, 0, h - 32, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    render_bars(vaos[front], &vis_data, (float)w, (float)h - 32);
+
+    float level;
+    pthread_mutex_lock(&vis_data.mutex);
+    level = vis_data.audio_level;
+    pthread_mutex_unlock(&vis_data.mutex);
+
+    draw_audio_level(level, w, h);
+
+    glfwSwapBuffers(win);
+  }
+
+  glfwDestroyWindow(win);
+  glfwTerminate();
+  return 0;
+}
