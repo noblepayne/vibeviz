@@ -31,6 +31,8 @@ extern "C" {
 #define SMOOTH_PEAK 0.19f
 #define DB_FLOOR -65.0f
 #define DB_CEIL  0.0f
+#define AUDIO_CLAMP 0.98f
+#define MAX_AUDIO_JUMP 2.2f
 
 struct VisData {
     float magnitudes[NUM_BARS];
@@ -39,6 +41,8 @@ struct VisData {
     float peaks_vel[NUM_BARS];
     float bin_maxes[NUM_BARS];
     float bin_ema[NUM_BARS];
+    float pre_smooth[NUM_BARS];
+    float silence_decay[NUM_BARS];
     std::mutex mutex;
 };
 
@@ -71,7 +75,13 @@ static void process_fft(VisData *vis_data, float *samples) {
             assert(global_plan && "FFTW Plan creation error!");
         }
     }
-    memcpy(fft_in, samples, sizeof(float) * BLOCK_SIZE);
+    float prev_max = 0.0f;
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+        float v = samples[i];
+        v = std::max(-AUDIO_CLAMP, std::min(AUDIO_CLAMP, v));
+        fft_in[i] = v;
+        prev_max = std::max(prev_max, fabsf(v));
+    }
     fftwf_execute(global_plan);
     float bin_avgs[NUM_BARS] = {0};
     for (int i = 0; i < NUM_BARS; ++i) {
@@ -91,8 +101,16 @@ static void process_fft(VisData *vis_data, float *samples) {
         bin_avgs[i] = (nsum > 0) ? sum / nsum : 0.0f;
     }
     std::lock_guard<std::mutex> lock(vis_data->mutex);
+    // Detect silence or spike.
+    bool silent = (prev_max < 1e-5f);
     for (int i = 0; i < NUM_BARS; ++i) {
         float mag = bin_avgs[i];
+        if (silent) mag = 0.0f;
+        // Spike clamp: limit maximum jump for each bin.
+        float &oldval = vis_data->pre_smooth[i];
+        if (mag > oldval * MAX_AUDIO_JUMP) mag = oldval * MAX_AUDIO_JUMP;
+        if (mag < oldval / MAX_AUDIO_JUMP) mag = oldval / MAX_AUDIO_JUMP;
+        vis_data->pre_smooth[i] = mag;
         float db = 20.0f * log10f(mag + 1e-10f);
         if (!std::isfinite(db)) db = DB_FLOOR;
         db = std::max(DB_FLOOR, db);
@@ -106,22 +124,36 @@ static void process_fft(VisData *vis_data, float *samples) {
         vis_data->target_mags[i] = finalval;
         if (finalval > vis_data->peaks[i] + 0.008f) {
             vis_data->peaks[i] = finalval;
-            vis_data->peaks_vel[i] = 0.1f + 0.065f * finalval;
+            vis_data->peaks_vel[i] = 0.09f + 0.065f * finalval;
         }
         if (mag > vis_data->bin_maxes[i])
             vis_data->bin_maxes[i] = mag;
         vis_data->bin_maxes[i] *= 0.994f;
         vis_data->bin_maxes[i] = std::max(1e-10f, vis_data->bin_maxes[i]);
+        // Silence smoothing/decay
+        if (silent) {
+            vis_data->silence_decay[i] += 0.05f;
+            vis_data->target_mags[i] *= expf(-vis_data->silence_decay[i]);
+        } else {
+            vis_data->silence_decay[i] *= 0.7f;
+        }
     }
 }
 
 static void interpolate_and_smooth(VisData *vis_data) {
     std::lock_guard<std::mutex> lock(vis_data->mutex);
     for (int i = 0; i < NUM_BARS; ++i) {
-        vis_data->magnitudes[i] += SMOOTH_FACTOR * (vis_data->target_mags[i] - vis_data->magnitudes[i]);
+        // Smoother approach: lowpass to target, faster on rise, slower on decay
+        if (vis_data->target_mags[i] > vis_data->magnitudes[i]) {
+            vis_data->magnitudes[i] += (SMOOTH_FACTOR+0.17f) * (vis_data->target_mags[i] - vis_data->magnitudes[i]);
+        } else {
+            vis_data->magnitudes[i] += (SMOOTH_FACTOR*0.37f) * (vis_data->target_mags[i] - vis_data->magnitudes[i]);
+        }
         vis_data->magnitudes[i] = std::max(0.0f, vis_data->magnitudes[i]);
+        // Peak decay with cubic curve polish
         if (vis_data->peaks[i] > vis_data->magnitudes[i] + 0.012f) {
-            vis_data->peaks[i] -= SMOOTH_PEAK * vis_data->peaks_vel[i];
+            float powdec = powf(vis_data->peaks_vel[i], 1.3f);
+            vis_data->peaks[i] -= (SMOOTH_PEAK + 0.08f) * powdec;
         }
         if (vis_data->peaks[i] < vis_data->magnitudes[i]) {
             vis_data->peaks[i] = vis_data->magnitudes[i];
@@ -159,8 +191,8 @@ static void synthwave_color(float t, float v, uint8_t *r, uint8_t *g, uint8_t *b
     else
         hue = 0.5f - (t - 0.7f) * (0.1f / 0.3f);
     hue = fmodf(hue + 1.0f, 1.0f);
-    float saturation = 0.7f + 0.3f * v;
-    float value = 0.6f + 0.4f * v;
+    float saturation = 0.72f + 0.23f * powf(v,0.8f);
+    float value = 0.63f + 0.33f * powf(v,0.5f);
     saturation = std::max(0.0f, std::min(1.0f, saturation));
     value = std::max(0.0f, std::min(1.0f, value));
     hsv_to_rgb(hue, saturation, value, r, g, b);
@@ -178,7 +210,7 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
     }
     uint8_t *data = frame->data[0];
     int linesize = frame->linesize[0];
-    uint8_t bg_r = 26, bg_g = 19, bg_b = 41;
+    uint8_t bg_r = 23, bg_g = 17, bg_b = 38;
     for (int y = 0; y < height; y++) {
         uint8_t* row = data + y * linesize;
         for (int x = 0; x < width * 3; x += 3) {
@@ -188,8 +220,8 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
         }
     }
     float margin_h = width * 0.02f;
-    float margin_v = height * 0.04f;
-    float bar_gap = width * 0.005f;
+    float margin_v = height * 0.042f;
+    float bar_gap = width * 0.0045f;
     float available_width = width - 2 * margin_h - (NUM_BARS - 1) * bar_gap;
     float bar_w = (available_width > 0) ? available_width / (float)NUM_BARS : 0;
     float y_base = margin_v;
@@ -202,7 +234,10 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
         float x1f = x0f + bar_w;
         float bar_val = vis_data->magnitudes[i];
         float peak_val = vis_data->peaks[i];
-        float bar_height = bar_val * y_max_area;
+        bar_val = std::max(0.0f, std::min(1.0f, bar_val));
+        peak_val = std::max(0.0f, std::min(1.0f, peak_val));
+        // Visual polish: add bar curvature smoothing.
+        float bar_height = powf(bar_val, 0.83f) * y_max_area;
         bar_height = std::max(min_bar_h, bar_height);
         float y0f = height - y_base;
         float y1f = height - (y_base + bar_height);
@@ -228,7 +263,7 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
                 row[x * 3 + 2] = b;
             }
         }
-        int highlight_h = std::max(1, static_cast<int>(bar_height * 0.1f + 2.0f));
+        int highlight_h = std::max(1, static_cast<int>(bar_height * 0.13f + 2.0f));
         highlight_h = std::min(highlight_h, y0i - y1i);
         if (highlight_h > 0) {
             uint8_t hr = static_cast<uint8_t>(std::min(255, (int)r + 60));
@@ -242,7 +277,7 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
                 if (y < 0 || y >= height) continue;
                 uint8_t* row = data + y * linesize;
                 float factor = (float)(y - hy0) / (float)highlight_h;
-                factor = 1.0f - factor;
+                factor = 1.0f - (factor * factor); // smoother highlight (polish)
                 uint8_t cur_r = (uint8_t)(hr * factor + r * (1.0f - factor));
                 uint8_t cur_g = (uint8_t)(hg * factor + g * (1.0f - factor));
                 uint8_t cur_b = (uint8_t)(hb * factor + b * (1.0f - factor));
@@ -255,7 +290,7 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
             }
         }
         float peak_min_diff = 0.015f;
-        float peak_height_abs = peak_val * y_max_area;
+        float peak_height_abs = powf(peak_val, 0.83f) * y_max_area;
         peak_height_abs = std::max(min_bar_h, peak_height_abs);
         if (peak_height_abs > bar_height + peak_min_diff * y_max_area && peak_val > 0.01f) {
             int peak_marker_h = 3;
@@ -264,10 +299,10 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width, int height
             int py1 = py0 + peak_marker_h;
             py0 = std::max(0, std::min(height, py0));
             py1 = std::max(py0, std::min(height, py1));
-            uint8_t pr = (uint8_t)(std::min(255, (int)r + 40));
-            uint8_t pg = (uint8_t)(std::min(255, (int)g + 40));
-            uint8_t pb = (uint8_t)(std::min(255, (int)b + 40));
-            int px_inset = std::max(1, (int)(bar_w * 0.1f));
+            uint8_t pr = (uint8_t)(std::min(255, (int)r + 43));
+            uint8_t pg = (uint8_t)(std::min(255, (int)g + 43));
+            uint8_t pb = (uint8_t)(std::min(255, (int)b + 43));
+            int px_inset = std::max(1, (int)(bar_w * 0.13f));
             int px0 = std::min(width, x0 + px_inset);
             int px1 = std::max(px0, x1 - px_inset);
             for (int y = py0; y < py1; y++) {
@@ -461,6 +496,8 @@ int main(int argc, char *argv[]) {
         vis_data.peaks_vel[i] = 0.1f;
         vis_data.magnitudes[i] = 0.0f;
         vis_data.target_mags[i] = 0.0f;
+        vis_data.pre_smooth[i] = 0.0001f;
+        vis_data.silence_decay[i] = 0.0f;
     }
     make_freq_table();
     int ret;
@@ -709,8 +746,40 @@ int main(int argc, char *argv[]) {
         interpolate_and_smooth(&vis_data);
     }
 
+    int consecutive_silence = 0;
+    int consecutive_empty = 0;
+
     while (!audio_eof) {
-        if (av_read_frame(audio_fmt_ctx, audio_packet) < 0) break;
+        int read_ok = av_read_frame(audio_fmt_ctx, audio_packet);
+        if (read_ok < 0) {
+            // graceful handling of audio EOF - pad silence
+            consecutive_empty++;
+            if (consecutive_empty > 10) break;
+            std::vector<float> silence(BLOCK_SIZE, 0.0f);
+            process_fft(&vis_data, silence.data());
+            interpolate_and_smooth(&vis_data);
+            while (sync.need_video_for_audio()) {
+                if (render_frame(rgb_frame, &vis_data, video_enc_ctx->width, video_enc_ctx->height) < 0) goto main_loop_end;
+                sws_scale(sws_ctx, (const uint8_t *const *)rgb_frame->data, rgb_frame->linesize, 0, video_enc_ctx->height, yuv_frame->data, yuv_frame->linesize);
+                yuv_frame->pts = video_pts;
+                video_pts++;
+                int send_ret = avcodec_send_frame(video_enc_ctx, yuv_frame);
+                while (send_ret >= 0 || send_ret == AVERROR(EAGAIN)) {
+                    AVPacket *pkt = av_packet_alloc();
+                    if (!pkt) break;
+                    int recv_ret = avcodec_receive_packet(video_enc_ctx, pkt);
+                    if (recv_ret == AVERROR(EAGAIN) || recv_ret == AVERROR_EOF) { av_packet_free(&pkt); break; }
+                    else if (recv_ret < 0) { av_packet_free(&pkt); break; }
+                    av_packet_rescale_ts(pkt, video_enc_ctx->time_base, video_fmt_ctx->streams[0]->time_base);
+                    pkt->stream_index = video_fmt_ctx->streams[0]->index;
+                    av_interleaved_write_frame(video_fmt_ctx, pkt);
+                    av_packet_free(&pkt);
+                }
+                sync.advance_video_frame();
+            }
+            continue;
+        }
+        consecutive_empty = 0;
         if (audio_packet->stream_index == audio_stream_index) {
             ret = avcodec_send_packet(audio_dec_ctx, audio_packet);
             if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) break;
@@ -755,8 +824,8 @@ int main(int argc, char *argv[]) {
                         int recv_ret = avcodec_receive_packet(video_enc_ctx, pkt);
                         if (recv_ret == AVERROR(EAGAIN) || recv_ret == AVERROR_EOF) { av_packet_free(&pkt); break; }
                         else if (recv_ret < 0) { av_packet_free(&pkt); break; }
-                        av_packet_rescale_ts(pkt, video_enc_ctx->time_base, video_stream->time_base);
-                        pkt->stream_index = video_stream->index;
+                        av_packet_rescale_ts(pkt, video_enc_ctx->time_base, video_fmt_ctx->streams[0]->time_base);
+                        pkt->stream_index = video_fmt_ctx->streams[0]->index;
                         av_interleaved_write_frame(video_fmt_ctx, pkt);
                         av_packet_free(&pkt);
                     }
