@@ -13,6 +13,7 @@
 #include <vector>
 
 extern "C" {
+#include <jpeglib.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
@@ -21,7 +22,6 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
-#include <jpeglib.h>
 #include <png.h>
 }
 
@@ -250,7 +250,8 @@ struct BGImage {
 
 static bool load_jpeg(const char *filename, BGImage &img) {
   FILE *fp = fopen(filename, "rb");
-  if (!fp) return false;
+  if (!fp)
+    return false;
   jpeg_decompress_struct cinfo;
   jpeg_error_mgr jerr;
   cinfo.err = jpeg_std_error(&jerr);
@@ -266,7 +267,8 @@ static bool load_jpeg(const char *filename, BGImage &img) {
   img.height = cinfo.output_height;
   int row_stride = img.width * cinfo.output_components;
   img.pixels.resize(img.width * img.height * 3);
-  JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+  JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo,
+                                                 JPOOL_IMAGE, row_stride, 1);
   for (int y = 0; y < img.height; y++) {
     jpeg_read_scanlines(&cinfo, buffer, 1);
     for (unsigned int x = 0; x < cinfo.output_width; x++) {
@@ -290,7 +292,8 @@ static bool load_jpeg(const char *filename, BGImage &img) {
 }
 static bool load_png(const char *filename, BGImage &img) {
   FILE *fp = fopen(filename, "rb");
-  if (!fp) return false;
+  if (!fp)
+    return false;
   uint8_t sig[8];
   if (fread(sig, 1, 8, fp) != 8) {
     fclose(fp);
@@ -300,7 +303,8 @@ static bool load_png(const char *filename, BGImage &img) {
     fclose(fp);
     return false;
   }
-  png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  png_structp png_ptr =
+      png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
   if (!png_ptr) {
     fclose(fp);
     return false;
@@ -323,12 +327,17 @@ static bool load_png(const char *filename, BGImage &img) {
   img.height = png_get_image_height(png_ptr, info_ptr);
   png_byte color_type = png_get_color_type(png_ptr, info_ptr);
   png_byte bit_depth = png_get_bit_depth(png_ptr, info_ptr);
-  if (bit_depth == 16) png_set_strip_16(png_ptr);
-  if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png_ptr);
-  if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png_ptr);
-  if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png_ptr);
+  if (bit_depth == 16)
+    png_set_strip_16(png_ptr);
+  if (color_type == PNG_COLOR_TYPE_PALETTE)
+    png_set_palette_to_rgb(png_ptr);
+  if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
+    png_set_expand_gray_1_2_4_to_8(png_ptr);
+  if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS))
+    png_set_tRNS_to_alpha(png_ptr);
   if (color_type == PNG_COLOR_TYPE_GRAY ||
-      color_type == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png_ptr);
+      color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
+    png_set_gray_to_rgb(png_ptr);
   png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER);
   png_read_update_info(png_ptr, info_ptr);
   int rowbytes = png_get_rowbytes(png_ptr, info_ptr);
@@ -353,7 +362,8 @@ static bool load_png(const char *filename, BGImage &img) {
 }
 static bool load_image(const char *filename, BGImage &img) {
   const char *dot = strrchr(filename, '.');
-  if (!dot) return false;
+  if (!dot)
+    return false;
   if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0)
     return load_jpeg(filename, img);
   if (strcasecmp(dot, ".png") == 0)
@@ -378,7 +388,8 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width,
   uint8_t *data = frame->data[0];
   int linesize = frame->linesize[0];
 
-  if (bgimg && bgimg->loaded && bgimg->width == width && bgimg->height == height) {
+  if (bgimg && bgimg->loaded && bgimg->width == width &&
+      bgimg->height == height) {
     for (int y = 0; y < height; y++) {
       uint8_t *row = data + y * linesize;
       const uint8_t *src = &bgimg->pixels[y * width * 3];
@@ -681,7 +692,8 @@ int main(int argc, char *argv[]) {
   if (argc < 3) {
     fprintf(
         stderr,
-        "Usage: %s <input_audio> <output_path> [background_image.jpg|.png]\n\nOutput path can be a file "
+        "Usage: %s <input_audio> <output_path> "
+        "[background_image.jpg|.png]\n\nOutput path can be a file "
         "(e.g., output.mp4) or RTMP URL (e.g., rtmp://server/app/streamkey)\n",
         argv[0]);
     return 1;
@@ -692,7 +704,10 @@ int main(int argc, char *argv[]) {
   BGImage bgimg;
   if (bg_name) {
     if (!load_image(bg_name, bgimg)) {
-      fprintf(stderr, "Warning: Failed to load background image '%s', using solid color.\n", bg_name);
+      fprintf(
+          stderr,
+          "Warning: Failed to load background image '%s', using solid color.\n",
+          bg_name);
     }
   }
   VisData vis_data = {};
@@ -1047,7 +1062,8 @@ int main(int argc, char *argv[]) {
       interpolate_and_smooth(&vis_data);
       while (sync.need_video_for_audio()) {
         if (render_frame(rgb_frame, &vis_data, video_enc_ctx->width,
-                         video_enc_ctx->height, (bgimg.loaded ? &bgimg : NULL)) < 0)
+                         video_enc_ctx->height,
+                         (bgimg.loaded ? &bgimg : NULL)) < 0)
           goto main_loop_end;
         sws_scale(sws_ctx, (const uint8_t *const *)rgb_frame->data,
                   rgb_frame->linesize, 0, video_enc_ctx->height,
@@ -1123,7 +1139,8 @@ int main(int argc, char *argv[]) {
 
         while (sync.need_video_for_audio()) {
           if (render_frame(rgb_frame, &vis_data, video_enc_ctx->width,
-                           video_enc_ctx->height, (bgimg.loaded ? &bgimg : NULL)) < 0)
+                           video_enc_ctx->height,
+                           (bgimg.loaded ? &bgimg : NULL)) < 0)
             goto main_loop_end;
           sws_scale(sws_ctx, (const uint8_t *const *)rgb_frame->data,
                     rgb_frame->linesize, 0, video_enc_ctx->height,

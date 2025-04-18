@@ -1,2 +1,0 @@
-#!/usr/bin/env bash
-../result/bin/cgip --model 'openrouter/optimus-alpha' --system-prompt "echo raw plain ASCII/unicode text only do not include markdown or backtick code blocks. Follow the prompt to the letter. Double check your work. do not include formatting of your output, do not include comments in your output, never answer in anything other than raw plaintext code output, do not give a preamble or response or postamble." | tee last_command
