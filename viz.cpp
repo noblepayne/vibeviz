@@ -21,6 +21,8 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
+#include <jpeglib.h>
+#include <png.h>
 }
 
 #define SAMPLE_RATE 44100
@@ -237,8 +239,131 @@ static void synthwave_color(float t, float v, uint8_t *r, uint8_t *g,
   hsv_to_rgb(hue, saturation, value, r, g, b);
 }
 
+// BGImage struct and loader
+struct BGImage {
+  std::vector<uint8_t> pixels;
+  int width;
+  int height;
+  bool loaded;
+  BGImage() : width(0), height(0), loaded(false) {}
+};
+
+static bool load_jpeg(const char *filename, BGImage &img) {
+  FILE *fp = fopen(filename, "rb");
+  if (!fp) return false;
+  jpeg_decompress_struct cinfo;
+  jpeg_error_mgr jerr;
+  cinfo.err = jpeg_std_error(&jerr);
+  jpeg_create_decompress(&cinfo);
+  jpeg_stdio_src(&cinfo, fp);
+  if (jpeg_read_header(&cinfo, TRUE) != 1) {
+    fclose(fp);
+    jpeg_destroy_decompress(&cinfo);
+    return false;
+  }
+  jpeg_start_decompress(&cinfo);
+  img.width = cinfo.output_width;
+  img.height = cinfo.output_height;
+  int row_stride = img.width * cinfo.output_components;
+  img.pixels.resize(img.width * img.height * 3);
+  JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+  for (int y = 0; y < img.height; y++) {
+    jpeg_read_scanlines(&cinfo, buffer, 1);
+    for (unsigned int x = 0; x < cinfo.output_width; x++) {
+      if (cinfo.output_components == 3) {
+        img.pixels[(y * img.width + x) * 3 + 0] = buffer[0][x * 3 + 0];
+        img.pixels[(y * img.width + x) * 3 + 1] = buffer[0][x * 3 + 1];
+        img.pixels[(y * img.width + x) * 3 + 2] = buffer[0][x * 3 + 2];
+      } else if (cinfo.output_components == 1) {
+        uint8_t v = buffer[0][x];
+        img.pixels[(y * img.width + x) * 3 + 0] = v;
+        img.pixels[(y * img.width + x) * 3 + 1] = v;
+        img.pixels[(y * img.width + x) * 3 + 2] = v;
+      }
+    }
+  }
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  fclose(fp);
+  img.loaded = true;
+  return true;
+}
+static bool load_png(const char *filename, BGImage &img) {
+  FILE *fp = fopen(filename, "rb");
+  if (!fp) return false;
+  uint8_t sig[8];
+  if (fread(sig, 1, 8, fp) != 8) {
+    fclose(fp);
+    return false;
+  }
+  if (png_sig_cmp(sig, 0, 8) != 0) {
+    fclose(fp);
+    return false;
+  }
+  png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if (!png_ptr) {
+    fclose(fp);
+    return false;
+  }
+  png_infop info_ptr = png_create_info_struct(png_ptr);
+  if (!info_ptr) {
+    png_destroy_read_struct(&png_ptr, NULL, NULL);
+    fclose(fp);
+    return false;
+  }
+  if (setjmp(png_jmpbuf(png_ptr))) {
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+    fclose(fp);
+    return false;
+  }
+  png_init_io(png_ptr, fp);
+  png_set_sig_bytes(png_ptr, 8);
+  png_read_info(png_ptr, info_ptr);
+  img.width = png_get_image_width(png_ptr, info_ptr);
+  img.height = png_get_image_height(png_ptr, info_ptr);
+  png_byte color_type = png_get_color_type(png_ptr, info_ptr);
+  png_byte bit_depth = png_get_bit_depth(png_ptr, info_ptr);
+  if (bit_depth == 16) png_set_strip_16(png_ptr);
+  if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png_ptr);
+  if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png_ptr);
+  if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png_ptr);
+  if (color_type == PNG_COLOR_TYPE_GRAY ||
+      color_type == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png_ptr);
+  png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER);
+  png_read_update_info(png_ptr, info_ptr);
+  int rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+  std::vector<png_bytep> row_pointers(img.height);
+  img.pixels.resize(img.width * img.height * 3);
+  std::vector<uint8_t> temp_row(rowbytes);
+  for (int y = 0; y < img.height; y++)
+    row_pointers[y] = &temp_row[0];
+  for (int y = 0; y < img.height; y++) {
+    png_read_row(png_ptr, row_pointers[y], NULL);
+    uint8_t *src = row_pointers[y];
+    for (int x = 0; x < img.width; x++) {
+      img.pixels[(y * img.width + x) * 3 + 0] = src[x * 4 + 0];
+      img.pixels[(y * img.width + x) * 3 + 1] = src[x * 4 + 1];
+      img.pixels[(y * img.width + x) * 3 + 2] = src[x * 4 + 2];
+    }
+  }
+  png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+  fclose(fp);
+  img.loaded = true;
+  return true;
+}
+static bool load_image(const char *filename, BGImage &img) {
+  const char *dot = strrchr(filename, '.');
+  if (!dot) return false;
+  if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0)
+    return load_jpeg(filename, img);
+  if (strcasecmp(dot, ".png") == 0)
+    return load_png(filename, img);
+  return false;
+}
+// End BGImage
+
 static int render_frame(AVFrame *frame, VisData *vis_data, int width,
-                        int height) {
+                        int height, BGImage *bgimg) {
   int ret = av_frame_make_writable(frame);
   if (ret < 0) {
     fprintf(stderr, "Error: Frame not writable (%s)\n", av_err2str(ret));
@@ -252,15 +377,25 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width,
   }
   uint8_t *data = frame->data[0];
   int linesize = frame->linesize[0];
-  uint8_t bg_r = 23, bg_g = 17, bg_b = 38;
-  for (int y = 0; y < height; y++) {
-    uint8_t *row = data + y * linesize;
-    for (int x = 0; x < width * 3; x += 3) {
-      row[x + 0] = bg_r;
-      row[x + 1] = bg_g;
-      row[x + 2] = bg_b;
+
+  if (bgimg && bgimg->loaded && bgimg->width == width && bgimg->height == height) {
+    for (int y = 0; y < height; y++) {
+      uint8_t *row = data + y * linesize;
+      const uint8_t *src = &bgimg->pixels[y * width * 3];
+      memcpy(row, src, width * 3);
+    }
+  } else {
+    uint8_t bg_r = 23, bg_g = 17, bg_b = 38;
+    for (int y = 0; y < height; y++) {
+      uint8_t *row = data + y * linesize;
+      for (int x = 0; x < width * 3; x += 3) {
+        row[x + 0] = bg_r;
+        row[x + 1] = bg_g;
+        row[x + 2] = bg_b;
+      }
     }
   }
+
   float margin_h = width * 0.02f;
   float margin_v = height * 0.042f;
   float bar_gap = width * 0.0045f;
@@ -546,13 +681,20 @@ int main(int argc, char *argv[]) {
   if (argc < 3) {
     fprintf(
         stderr,
-        "Usage: %s <input_audio> <output_path>\n\nOutput path can be a file "
+        "Usage: %s <input_audio> <output_path> [background_image.jpg|.png]\n\nOutput path can be a file "
         "(e.g., output.mp4) or RTMP URL (e.g., rtmp://server/app/streamkey)\n",
         argv[0]);
     return 1;
   }
   const char *input_filename = argv[1];
   const char *output_filename = argv[2];
+  const char *bg_name = (argc > 3) ? argv[3] : NULL;
+  BGImage bgimg;
+  if (bg_name) {
+    if (!load_image(bg_name, bgimg)) {
+      fprintf(stderr, "Warning: Failed to load background image '%s', using solid color.\n", bg_name);
+    }
+  }
   VisData vis_data = {};
   for (int i = 0; i < NUM_BARS; ++i) {
     vis_data.bin_maxes[i] = 1e-6f;
@@ -905,7 +1047,7 @@ int main(int argc, char *argv[]) {
       interpolate_and_smooth(&vis_data);
       while (sync.need_video_for_audio()) {
         if (render_frame(rgb_frame, &vis_data, video_enc_ctx->width,
-                         video_enc_ctx->height) < 0)
+                         video_enc_ctx->height, (bgimg.loaded ? &bgimg : NULL)) < 0)
           goto main_loop_end;
         sws_scale(sws_ctx, (const uint8_t *const *)rgb_frame->data,
                   rgb_frame->linesize, 0, video_enc_ctx->height,
@@ -981,7 +1123,7 @@ int main(int argc, char *argv[]) {
 
         while (sync.need_video_for_audio()) {
           if (render_frame(rgb_frame, &vis_data, video_enc_ctx->width,
-                           video_enc_ctx->height) < 0)
+                           video_enc_ctx->height, (bgimg.loaded ? &bgimg : NULL)) < 0)
             goto main_loop_end;
           sws_scale(sws_ctx, (const uint8_t *const *)rgb_frame->data,
                     rgb_frame->linesize, 0, video_enc_ctx->height,
