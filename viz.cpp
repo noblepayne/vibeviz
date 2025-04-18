@@ -544,7 +544,11 @@ struct SyncController {
 
 int main(int argc, char *argv[]) {
   if (argc < 3) {
-    fprintf(stderr, "Usage: %s <input_audio> <output_video.mp4>\n", argv[0]);
+    fprintf(
+        stderr,
+        "Usage: %s <input_audio> <output_path>\n\nOutput path can be a file "
+        "(e.g., output.mp4) or RTMP URL (e.g., rtmp://server/app/streamkey)\n",
+        argv[0]);
     return 1;
   }
   const char *input_filename = argv[1];
@@ -613,13 +617,33 @@ int main(int argc, char *argv[]) {
     cleanup_resources();
     return 1;
   }
-  if ((ret = avformat_alloc_output_context2(&video_fmt_ctx, NULL, NULL,
+
+  // --- RTMP/file output adaptation starts here ---
+  bool is_rtmp = strncmp(output_filename, "rtmp://", 7) == 0;
+  const char *format_name = NULL;
+  if (is_rtmp) {
+    format_name = "flv";
+  }
+  if ((ret = avformat_alloc_output_context2(&video_fmt_ctx, NULL, format_name,
                                             output_filename)) < 0) {
     fprintf(stderr, "Error creating output context for '%s': %s\n",
             output_filename, av_err2str(ret));
     cleanup_resources();
     return 1;
   }
+
+  if (is_rtmp) {
+    av_dict_set(&video_fmt_ctx->metadata, "flush_packets", "1", 0);
+    video_fmt_ctx->max_delay = 100 * 1000; // 100ms
+  }
+
+  fprintf(stderr, "Output format: %s\n", video_fmt_ctx->oformat->name);
+
+  // TODO: DELETE?
+  // if (is_rtmp) {
+  //   video_fmt_ctx->oformat->flags |= AVFMT_NOFILE;
+  // }
+
   const AVCodec *video_encoder =
       avcodec_find_encoder(video_fmt_ctx->oformat->video_codec);
   if (!video_encoder) {
@@ -630,19 +654,24 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   }
+  // TODO: hack
+  video_encoder = avcodec_find_encoder_by_name("libx264");
   AVStream *video_stream = avformat_new_stream(video_fmt_ctx, video_encoder);
   if (!video_stream) {
     fprintf(stderr, "Error creating video stream\n");
     cleanup_resources();
     return 1;
   }
+
+  // Video encoder setup
   video_enc_ctx = avcodec_alloc_context3(video_encoder);
   if (!video_enc_ctx) {
     fprintf(stderr, "Error: Failed to allocate video encoder context\n");
     cleanup_resources();
     return 1;
   }
-  video_enc_ctx->codec_id = video_fmt_ctx->oformat->video_codec;
+  // TODO: needed?
+  // video_enc_ctx->codec_id = video_fmt_ctx->oformat->video_codec;
   video_enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
   video_enc_ctx->width = 1024;
   video_enc_ctx->height = 520;
@@ -650,7 +679,17 @@ int main(int argc, char *argv[]) {
   video_enc_ctx->framerate = (AVRational){45, 1};
   video_enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
   video_enc_ctx->bit_rate = 4000000;
-  av_opt_set(video_enc_ctx->priv_data, "preset", "medium", 0);
+  video_enc_ctx->gop_size = 90;    // Keyframe every 2 sec (45 fps * 2s)
+  video_enc_ctx->max_b_frames = 0; // <--- KEY: no B-frames for RTMP streaming
+
+  if (is_rtmp) {
+    av_opt_set(video_enc_ctx->priv_data, "preset", "ultrafast", 0);
+    av_opt_set(video_enc_ctx->priv_data, "tune", "zerolatency", 0);
+    av_opt_set(video_enc_ctx->priv_data, "x264-params",
+               "keyint=90:min-keyint=90:scenecut=0", 0); // enforce GOP
+  } else {
+    av_opt_set(video_enc_ctx->priv_data, "preset", "medium", 0);
+  }
   if (video_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
     video_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   }
@@ -666,6 +705,27 @@ int main(int argc, char *argv[]) {
     cleanup_resources();
     return 1;
   }
+
+  // *** START ADDED DIAGNOSTIC BLOCK ***
+  fprintf(stderr,
+          "DEBUG: Copied video_stream codecpar: width=%d, height=%d, "
+          "format=%d, codec_id=%d\n",
+          video_stream->codecpar->width, video_stream->codecpar->height,
+          video_stream->codecpar->format, video_stream->codecpar->codec_id);
+
+  // Sanity check
+  if (video_stream->codecpar->width <= 0 ||
+      video_stream->codecpar->height <= 0) {
+    fprintf(stderr,
+            "FATAL ERROR: Invalid dimensions (width=%d, height=%d) detected in "
+            "video stream codecpar *after* copying from encoder context!\n",
+            video_stream->codecpar->width, video_stream->codecpar->height);
+    // You might want to force exit here if this happens
+    cleanup_resources();
+    return 1; // Or handle appropriately
+  }
+  // *** END ADDED DIAGNOSTIC BLOCK ***
+
   const AVCodec *audio_encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
   if (!audio_encoder) {
     fprintf(stderr, "Error: AAC encoder not found\n");
@@ -705,7 +765,10 @@ int main(int argc, char *argv[]) {
     cleanup_resources();
     return 1;
   }
-  if (!(video_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+  // For RTMP, we need to open the output even though AVFMT_NOFILE might be set
+  // For file output, we only open if AVFMT_NOFILE is not set
+  if (is_rtmp || !(video_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+    fprintf(stderr, "Opening output '%s'...\n", output_filename);
     if ((ret = avio_open(&video_fmt_ctx->pb, output_filename,
                          AVIO_FLAG_WRITE)) < 0) {
       fprintf(stderr, "Error opening output file '%s': %s\n", output_filename,
@@ -713,12 +776,20 @@ int main(int argc, char *argv[]) {
       cleanup_resources();
       return 1;
     }
+    // For streaming, set non-blocking mode
+    if (is_rtmp) {
+      fprintf(stderr, "Setting non-blocking mode for streaming...\n");
+      video_fmt_ctx->flags |= AVFMT_FLAG_NOBUFFER;
+      video_fmt_ctx->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+    }
   }
   if ((ret = avformat_write_header(video_fmt_ctx, NULL)) < 0) {
     fprintf(stderr, "Error writing output header: %s\n", av_err2str(ret));
     cleanup_resources();
     return 1;
   }
+  // --- RTMP/file output adaptation ENDS ---
+
   AVChannelLayout mono_layout;
   av_channel_layout_default(&mono_layout, 1);
   if (swr_alloc_set_opts2(&swr_vis_ctx, &mono_layout, AV_SAMPLE_FMT_FLTP,
@@ -840,6 +911,7 @@ int main(int argc, char *argv[]) {
                   rgb_frame->linesize, 0, video_enc_ctx->height,
                   yuv_frame->data, yuv_frame->linesize);
         yuv_frame->pts = video_pts;
+        yuv_frame->pict_type = AV_PICTURE_TYPE_NONE;
         video_pts++;
         int send_ret = avcodec_send_frame(video_enc_ctx, yuv_frame);
         while (send_ret >= 0 || send_ret == AVERROR(EAGAIN)) {
