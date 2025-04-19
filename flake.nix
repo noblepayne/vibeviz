@@ -1,5 +1,5 @@
 {
-  description = "A simple audio decoder flake";
+  description = "Audio visualizer that converts audio streams to video with real-time visualization";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -15,7 +15,7 @@
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
     in
       pkgs.stdenv.mkDerivation {
-        pname = "audio-decoder";
+        pname = "vibeviz";
         version = "0.1";
         src = ./.;
 
@@ -30,7 +30,7 @@
 
         buildPhase = ''
           runHook preBuild
-          g++ viz.cpp -o audio-decoder \
+          g++ vibeviz.cpp -o vibeviz \
             $(pkg-config --cflags --libs libavformat libavcodec libavutil libswscale libswresample libjpeg libpng) \
             -lfftw3f \
             -O2 -lpthread -ldl
@@ -39,7 +39,7 @@
 
         installPhase = ''
           runHook preInstall
-          install -Dm755 audio-decoder $out/bin/audio-decoder
+          install -Dm755 vibeviz $out/bin/vibeviz
           runHook postInstall
         '';
       };
