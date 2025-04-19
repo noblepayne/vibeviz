@@ -409,7 +409,7 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width,
 
   float margin_h = width * 0.02f;
   // float margin_v = height * 0.042f; ORIGINAL
-  float margin_v = height * 0.15f;  // for JB graphic
+  float margin_v = height * 0.15f; // for JB graphic
   float bar_gap = width * 0.0045f;
   float available_width = width - 2 * margin_h - (NUM_BARS - 1) * bar_gap;
   float bar_w = (available_width > 0) ? available_width / (float)NUM_BARS : 0;
