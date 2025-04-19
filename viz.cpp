@@ -408,7 +408,8 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width,
   }
 
   float margin_h = width * 0.02f;
-  float margin_v = height * 0.042f;
+  // float margin_v = height * 0.042f; ORIGINAL
+  float margin_v = height * 0.15f;  // for JB graphic
   float bar_gap = width * 0.0045f;
   float available_width = width - 2 * margin_h - (NUM_BARS - 1) * bar_gap;
   float bar_w = (available_width > 0) ? available_width / (float)NUM_BARS : 0;
@@ -830,8 +831,8 @@ int main(int argc, char *argv[]) {
   // TODO: needed?
   // video_enc_ctx->codec_id = video_fmt_ctx->oformat->video_codec;
   video_enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
-  video_enc_ctx->width = 1024;
-  video_enc_ctx->height = 520;
+  video_enc_ctx->width = 1280;
+  video_enc_ctx->height = 720;
   video_enc_ctx->time_base = (AVRational){1, 45};
   video_enc_ctx->framerate = (AVRational){45, 1};
   video_enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
