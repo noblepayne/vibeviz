@@ -2,7 +2,11 @@
 
 Audio visualizer that converts audio streams to video with real-time visualization. Supports Icecast, MP3, M4A inputs and outputs to MP4/MKV files or RTMP streams.
 
+
 **Disclaimer**: Much of this tool was generated using LLMs.
+
+
+![Screenshot](./screenshot.jpg)
 
 ## Features
 
