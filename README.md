@@ -2,6 +2,8 @@
 
 Audio visualizer that converts audio streams to video with real-time visualization. Supports Icecast, MP3, M4A inputs and outputs to MP4/MKV files or RTMP streams.
 
+**Disclaimer**: Much of this tool was generated using LLMs.
+
 ## Features
 
 - Real-time audio spectrum visualization
@@ -9,7 +11,14 @@ Audio visualizer that converts audio streams to video with real-time visualizati
 - Background image support (JPEG/PNG)
 - Output to file (MP4/MKV) or RTMP stream
 - Smooth animations and peak detection
-- Audio passthrough with AAC encoding
+
+## TODO
+
+- [ ] Support WAV/FLAC with full speed visuals
+- [ ] Easy configuration/customization.
+- [ ] Different resolutions.
+- [ ] Themes? Color control?
+- [ ] Audio passthrough w/o re-encode where possible (possibly happens already with aac? TODO: check)
 
 ## Requirements
 
