@@ -790,6 +790,13 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // TODO: mkv and mp4
+  //if (!is_rtmp && strstr(video_fmt_ctx->oformat->name, "mp4")) {
+  if (!is_rtmp) {
+    av_dict_set(&video_fmt_ctx->metadata, "movflags", "frag_keyframe+empty_moov+default_base_moof+faststart", 0);
+    fprintf(stderr, "Enabled faststart for MP4 output\n");
+  }
+
   if (is_rtmp) {
     av_dict_set(&video_fmt_ctx->metadata, "flush_packets", "1", 0);
     video_fmt_ctx->max_delay = 100 * 1000; // 100ms
