@@ -222,22 +222,23 @@ static void hsv_to_rgb(float h, float s, float v, uint8_t *r, uint8_t *g,
   *b = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, bf * 255.0f)));
 }
 
-static void synthwave_color(float t, float v, uint8_t *r, uint8_t *g,
-                            uint8_t *b) {
-  float hue;
-  if (t < 0.3f)
-    hue = 0.83f + t * (0.8f / 0.3f);
-  else if (t < 0.7f)
-    hue = 0.66f - (t - 0.3f) * (0.16f / 0.4f);
-  else
-    hue = 0.5f - (t - 0.7f) * (0.1f / 0.3f);
+
+static void synthwave_color(float t, float v, uint8_t *r, uint8_t *g, uint8_t *b) {
+  float base_hues[2] = {154.0f/360.0f, 23.0f/360.0f}; // Converted hex colors to HSV hues
+  float base_sats[2] = {0.41f, 0.77f};
+  float base_vals[2] = {0.40f, 0.88f};
+  
+  float hue = base_hues[0] + t*(base_hues[1]-base_hues[0]);
+  float saturation = base_sats[0] + t*(base_sats[1]-base_sats[0]) + 0.15f*powf(v, 0.8f);
+  float value = base_vals[0] + t*(base_vals[1]-base_vals[0]) + 0.2f*powf(v, 0.5f);
+  
   hue = fmodf(hue + 1.0f, 1.0f);
-  float saturation = 0.72f + 0.23f * powf(v, 0.8f);
-  float value = 0.63f + 0.33f * powf(v, 0.5f);
   saturation = std::max(0.0f, std::min(1.0f, saturation));
   value = std::max(0.0f, std::min(1.0f, value));
+  
   hsv_to_rgb(hue, saturation, value, r, g, b);
 }
+
 
 // BGImage struct and loader
 struct BGImage {
