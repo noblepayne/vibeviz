@@ -21,8 +21,11 @@ Audio visualizer that converts audio streams to video with real-time visualizati
 - [ ] Support WAV/FLAC with full speed visuals
 - [ ] Easy configuration/customization.
 - [ ] Different resolutions.
-- [ ] Themes? Color control?
 - [ ] Audio passthrough w/o re-encode where possible (possibly happens already with aac? TODO: check)
+- [ ] Better theme support and better themes
+
+### Done
+- [x] Themes? Color control?
 
 ## Requirements
 
@@ -52,10 +55,10 @@ Examples:
 
 ```sh
 # Local file output
-vibeviz input.mp3 output.mp4 background.jpg
+vibeviz input.mp3 output.mp4 background.jpg original
 
 # RTMP stream
-vibeviz http://icecast.example.com/stream.mp3 rtmp://live.twitch.tv/app/streamkey
+vibeviz http://icecast.example.com/stream.mp3 rtmp://live.twitch.tv/app/streamkey blue
 ```
 
 ## License
