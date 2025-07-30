@@ -115,6 +115,9 @@ static void process_fft(VisData *vis_data, float *samples) {
       mag = 0.0f;
     // Spike clamp: limit maximum jump for each bin.
     float &oldval = vis_data->pre_smooth[i];
+    // TODO: good enough?
+    // prevent bins from sticking at zero after prolonged silence
+    mag = std::max(1e-4f, mag);
     if (mag > oldval * MAX_AUDIO_JUMP)
       mag = oldval * MAX_AUDIO_JUMP;
     if (mag < oldval / MAX_AUDIO_JUMP)
