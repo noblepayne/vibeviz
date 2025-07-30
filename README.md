@@ -40,8 +40,13 @@ nix build
 ## Usage
 
 ```sh
-vibeviz <input_audio> <output_path> [background_image.jpg|.png]
+vibeviz <input_audio> <output_path> [background_image.jpg|.png] [theme]
 ```
+
+Themes:
+- original / synthwave
+- nature / launch
+- blue / ice
 
 Examples:
 

@@ -36,6 +36,14 @@ extern "C" {
 #define AUDIO_CLAMP 0.98f
 #define MAX_AUDIO_JUMP 2.2f
 
+enum Theme {
+  THEME_SYNTHWAVE,
+  THEME_NATURE, 
+  THEME_BLUE_ICE
+};
+
+static Theme current_theme = THEME_SYNTHWAVE;
+
 struct VisData {
   float magnitudes[NUM_BARS];
   float target_mags[NUM_BARS];
@@ -227,19 +235,90 @@ static void hsv_to_rgb(float h, float s, float v, uint8_t *r, uint8_t *g,
 
 
 static void synthwave_color(float t, float v, uint8_t *r, uint8_t *g, uint8_t *b) {
-  float base_hues[2] = {154.0f/360.0f, 23.0f/360.0f}; // Converted hex colors to HSV hues
-  float base_sats[2] = {0.41f, 0.77f};
-  float base_vals[2] = {0.40f, 0.88f};
-  
-  float hue = base_hues[0] + t*(base_hues[1]-base_hues[0]);
-  float saturation = base_sats[0] + t*(base_sats[1]-base_sats[0]) + 0.15f*powf(v, 0.8f);
-  float value = base_vals[0] + t*(base_vals[1]-base_vals[0]) + 0.2f*powf(v, 0.5f);
-  
-  hue = fmodf(hue + 1.0f, 1.0f);
-  saturation = std::max(0.0f, std::min(1.0f, saturation));
-  value = std::max(0.0f, std::min(1.0f, value));
-  
-  hsv_to_rgb(hue, saturation, value, r, g, b);
+  switch (current_theme) {
+    case THEME_SYNTHWAVE: {
+      // Original synthwave theme
+      float hue;
+      if (t < 0.3f)
+        hue = 0.83f + t * (0.8f / 0.3f);
+      else if (t < 0.7f)
+        hue = 0.66f - (t - 0.3f) * (0.16f / 0.4f);
+      else
+        hue = 0.5f - (t - 0.7f) * (0.1f / 0.3f);
+      
+      hue = fmodf(hue + 1.0f, 1.0f);
+      float saturation = 0.72f + 0.23f * powf(v, 0.8f);
+      float value = 0.63f + 0.33f * powf(v, 0.5f);
+      saturation = std::max(0.0f, std::min(1.0f, saturation));
+      value = std::max(0.0f, std::min(1.0f, value));
+      
+      hsv_to_rgb(hue, saturation, value, r, g, b);
+      break;
+    }
+    
+    case THEME_NATURE: {
+      // Nature theme
+      float base_hues[2] = {154.0f/360.0f, 23.0f/360.0f}; // Converted hex colors to HSV hues
+      float base_sats[2] = {0.41f, 0.77f};
+      float base_vals[2] = {0.40f, 0.88f};
+      
+      float hue = base_hues[0] + t*(base_hues[1]-base_hues[0]);
+      float saturation = base_sats[0] + t*(base_sats[1]-base_sats[0]) + 0.15f*powf(v, 0.8f);
+      float value = base_vals[0] + t*(base_vals[1]-base_vals[0]) + 0.2f*powf(v, 0.5f);
+      
+      hue = fmodf(hue + 1.0f, 1.0f);
+      saturation = std::max(0.0f, std::min(1.0f, saturation));
+      value = std::max(0.0f, std::min(1.0f, value));
+      
+      hsv_to_rgb(hue, saturation, value, r, g, b);
+      break;
+    }
+    
+    case THEME_BLUE_ICE: {
+      // blue theme with white highlights
+      float hue;
+      // Blue gradient from deep blue (0.6) to cyan (0.5)
+      if (t < 0.3f)
+        hue = 0.63f - t * (0.06f / 0.3f);
+      else if (t < 0.7f)
+        hue = 0.6f - (t - 0.3f) * (0.05f / 0.4f);
+      else
+        hue = 0.57f - (t - 0.7f) * (0.05f / 0.3f);
+      
+      hue = fmodf(hue + 1.0f, 1.0f);
+      
+      // Adjust saturation and value for blue/white theme
+      float saturation = 0.7f + 0.25f * powf(v, 0.6f);
+      float value = 0.7f + 0.3f * powf(v, 0.4f);
+      
+      // Add white highlights for higher values
+      if (v > 0.8f) {
+        float white_mix = (v - 0.8f) / 0.2f;
+        saturation *= (1.0f - white_mix * 0.7f);
+        value = std::min(1.0f, value + white_mix * 0.3f);
+      }
+      
+      saturation = std::max(0.0f, std::min(1.0f, saturation));
+      value = std::max(0.0f, std::min(1.0f, value));
+      
+      hsv_to_rgb(hue, saturation, value, r, g, b);
+      break;
+    }
+  }
+}
+
+static void get_background_color(uint8_t *r, uint8_t *g, uint8_t *b) {
+  switch (current_theme) {
+    case THEME_SYNTHWAVE:
+      *r = 23; *g = 17; *b = 38;  // Original purple-ish
+      break;
+    case THEME_NATURE:
+      *r = 23; *g = 17; *b = 38;  // Same as synthwave for now
+      break;
+    case THEME_BLUE_ICE:
+      *r = 10; *g = 15; *b = 30;  // blue background
+      break;
+  }
 }
 
 
@@ -400,7 +479,9 @@ static int render_frame(AVFrame *frame, VisData *vis_data, int width,
       memcpy(row, src, width * 3);
     }
   } else {
-    uint8_t bg_r = 23, bg_g = 17, bg_b = 38;
+    // uint8_t bg_r = 23, bg_g = 17, bg_b = 38;
+    uint8_t bg_r, bg_g, bg_b;
+    get_background_color(&bg_r, &bg_g, &bg_b);
     for (int y = 0; y < height; y++) {
       uint8_t *row = data + y * linesize;
       for (int x = 0; x < width * 3; x += 3) {
@@ -693,19 +774,41 @@ struct SyncController {
   double get_audio_pos_sec() const { return audio_pts_sec; }
 };
 
+// CLI theme parsing
+static void set_theme_from_string(const char* theme_name) {
+  if (!theme_name) return;
+  
+  if (strcasecmp(theme_name, "original") == 0 || strcasecmp(theme_name, "synthwave") == 0) {
+    current_theme = THEME_SYNTHWAVE;
+    fprintf(stderr, "Using theme: %s\n", theme_name);
+  } else if (strcasecmp(theme_name, "launch") == 0 || strcasecmp(theme_name, "nature") == 0) {
+    current_theme = THEME_NATURE;
+    fprintf(stderr, "Using theme: %s\n", theme_name);
+  } else if (strcasecmp(theme_name, "blue") == 0 || strcasecmp(theme_name, "ice") == 0) {
+    current_theme = THEME_BLUE_ICE;
+    fprintf(stderr, "Using theme: %s\n", theme_name);
+  } else {
+    fprintf(stderr, "UNKNOWN THEME: %s ; Using theme: original\n", theme_name);
+  }
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 3) {
     fprintf(
         stderr,
         "Usage: %s <input_audio> <output_path> "
-        "[background_image.jpg|.png]\n\nOutput path can be a file "
-        "(e.g., output.mp4) or RTMP URL (e.g., rtmp://server/app/streamkey)\n",
+        "[background_image.jpg|.png] "
+        "[theme]\n\nOutput path can be a file "
+        "(e.g., output.mp4) or RTMP URL (e.g., rtmp://server/app/streamkey)\n"
+        "Themes: original/synthwave, launch/nature, blue/ice\n",
         argv[0]);
     return 1;
   }
   const char *input_filename = argv[1];
   const char *output_filename = argv[2];
   const char *bg_name = (argc > 3) ? argv[3] : NULL;
+  const char *theme_name = (argc > 4) ? argv[4] : "original";
+  set_theme_from_string(theme_name);
   BGImage bgimg;
   if (bg_name) {
     if (!load_image(bg_name, bgimg)) {
